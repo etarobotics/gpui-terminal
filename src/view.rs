@@ -52,11 +52,25 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use gpui::{Edges, *};
+use std::cell::Cell;
 use std::io::{Read, Write};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+
+// gpui-component's `Root` binds Tab / Shift-Tab to focus navigation, which
+// otherwise swallows those keys before the terminal's key handler sees them.
+// Reclaim them (and copy/paste) as terminal actions bound in the terminal's own
+// key context so they win over ancestor bindings when the terminal is focused.
+gpui::actions!(gpui_terminal, [SendTab, SendBacktab, Copy, Paste]);
+
+/// Key context the terminal element declares so its Tab/Shift-Tab bindings win
+/// over an ancestor (gpui-component `Root`) that also binds Tab.
+const KEY_CONTEXT: &str = "GpuiTerminal";
 
 /// Configuration for terminal creation and runtime updates.
 ///
@@ -411,6 +425,18 @@ pub struct TerminalView {
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+
+    /// Last painted content bounds, captured by the canvas so mouse handlers can
+    /// map pixel positions to grid cells.
+    last_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+
+    /// Last *measured* (cell_width, cell_height) in px, captured by the canvas.
+    /// Mouse→cell mapping must use these, not the pre-measurement estimate on
+    /// `renderer`, or the row/column it computes won't match what's drawn.
+    last_cell_size: Rc<Cell<(f32, f32)>>,
+
+    /// Whether a mouse drag-selection is in progress.
+    selecting: bool,
 }
 
 impl TerminalView {
@@ -449,6 +475,20 @@ impl TerminalView {
         W: Write + Send + 'static,
         R: Read + Send + 'static,
     {
+        // Bind Tab / Shift-Tab (once, process-wide) in the terminal's key
+        // context so they reach the shell instead of the host UI's focus nav.
+        static BIND_KEYS: std::sync::Once = std::sync::Once::new();
+        BIND_KEYS.call_once(|| {
+            cx.bind_keys([
+                KeyBinding::new("tab", SendTab, Some(KEY_CONTEXT)),
+                KeyBinding::new("shift-tab", SendBacktab, Some(KEY_CONTEXT)),
+                KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
+                KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
+                KeyBinding::new("ctrl-shift-c", Copy, Some(KEY_CONTEXT)),
+                KeyBinding::new("ctrl-shift-v", Paste, Some(KEY_CONTEXT)),
+            ]);
+        });
+
         // Create event channel for terminal events
         let (event_tx, event_rx) = mpsc::channel();
 
@@ -532,6 +572,9 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            last_bounds: Rc::new(Cell::new(None)),
+            last_cell_size: Rc::new(Cell::new((0.0, 0.0))),
+            selecting: false,
         }
     }
 
@@ -715,11 +758,12 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
         {
+            cx.stop_propagation();
             return; // Event consumed by handler
         }
 
@@ -727,68 +771,147 @@ impl TerminalView {
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
+            // Consume the event so the host UI's focus system (Tab navigation,
+            // etc.) doesn't also act on keys that belong to the shell.
+            cx.stop_propagation();
         }
+    }
+
+    /// Forward raw bytes to the pty (used by the Tab / Shift-Tab actions that
+    /// reclaim those keys from the host UI's focus navigation).
+    fn write_pty(&self, bytes: &[u8]) {
+        let mut writer = self.stdin_writer.lock();
+        let _ = writer.write_all(bytes).and_then(|()| writer.flush());
+    }
+
+    fn on_send_tab(&mut self, _: &SendTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.write_pty(b"\t");
+        cx.stop_propagation();
+    }
+
+    fn on_send_backtab(&mut self, _: &SendBacktab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.write_pty(b"\x1b[Z");
+        cx.stop_propagation();
     }
 
     /// Handle mouse down events.
     ///
-    /// Currently a placeholder for future mouse selection and interaction support.
-    fn on_mouse_down(
-        &mut self,
-        _event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Request focus when clicking the terminal
-        window.focus(&self.focus_handle);
+    /// Map a pixel position to a grid point + which half of the cell it's on,
+    /// accounting for padding, cell size, and the current scrollback offset.
+    fn cell_at(&self, pos: Point<Pixels>) -> Option<(AlacPoint, Side)> {
+        let bounds = self.last_bounds.get()?;
+        let pad = self.config.padding;
+        let ox = f32::from(bounds.origin.x + pad.left);
+        let oy = f32::from(bounds.origin.y + pad.top);
+        // Use the measured cell size the canvas rendered with, not the estimate.
+        let (cw, ch) = self.last_cell_size.get();
+        let (cw, ch) = (cw.max(1.0), ch.max(1.0));
+        let (cols, rows) = self.dimensions();
+        let fx = (f32::from(pos.x) - ox) / cw;
+        let fy = (f32::from(pos.y) - oy) / ch;
+        let col = (fx.floor() as i32).clamp(0, cols as i32 - 1) as usize;
+        let row = (fy.floor() as i32).clamp(0, rows as i32 - 1);
+        let display_offset = self.state.with_term(|t| t.grid().display_offset()) as i32;
+        let side = if fx.fract() < 0.5 { Side::Left } else { Side::Right };
+        Some((AlacPoint::new(Line(row - display_offset), Column(col)), side))
+    }
+
+    /// Start a drag-selection at the clicked cell.
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        if let Some((point, side)) = self.cell_at(event.position) {
+            self.state.with_term_mut(|t| {
+                t.selection = Some(Selection::new(SelectionType::Simple, point, side));
+            });
+            self.selecting = true;
+        }
         cx.notify();
-
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+    /// Finish the drag-selection and copy it to the clipboard (select-to-copy).
+    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if let Some(text) = self.state.with_term(|t| t.selection_to_string())
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_move(
-        &mut self,
-        _event: &MouseMoveEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+    /// Extend the selection while dragging with the left button held.
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if let Some((point, side)) = self.cell_at(event.position) {
+            self.state.with_term_mut(|t| {
+                if let Some(sel) = t.selection.as_mut() {
+                    sel.update(point, side);
+                }
+            });
+            cx.notify();
+        }
+    }
+
+    /// Copy the current selection to the clipboard.
+    fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.state.with_term(|t| t.selection_to_string())
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        cx.stop_propagation();
+    }
+
+    /// Paste clipboard text into the pty (bracketed when the app enabled it).
+    fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            let bracketed = self
+                .state
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+            let mut w = self.stdin_writer.lock();
+            if bracketed {
+                let _ = w.write_all(b"\x1b[200~");
+            }
+            let _ = w.write_all(text.as_bytes());
+            if bracketed {
+                let _ = w.write_all(b"\x1b[201~");
+            }
+            let _ = w.flush();
+        }
+        cx.stop_propagation();
     }
 
     /// Handle scroll events.
     ///
     /// Currently a placeholder for future scrollback support.
-    fn on_scroll(
-        &mut self,
-        _event: &ScrollWheelEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // The alternate screen (vim/htop/…) has no scrollback — those apps own
+        // the viewport, so leave the wheel to them.
+        if self
+            .state
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+        {
+            return;
+        }
+        // Convert the wheel delta to a line count. Positive = scroll up into
+        // history (alacritty's Scroll::Delta is positive-up).
+        let line_height = f32::from(self.renderer.cell_height).max(1.0);
+        let lines = match event.delta {
+            ScrollDelta::Lines(p) => p.y.round() as i32,
+            ScrollDelta::Pixels(p) => (f32::from(p.y) / line_height).round() as i32,
+        };
+        if lines != 0 {
+            self.state.with_term_mut(|term| {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+            });
+            cx.notify();
+        }
     }
 
     /// Process pending terminal events.
@@ -821,6 +944,13 @@ impl TerminalView {
                 TerminalEvent::ClipboardLoad => {
                     // Terminal wants to load data from clipboard
                     // TODO: Implement clipboard integration
+                }
+                TerminalEvent::PtyWrite(bytes) => {
+                    // Reply to a program's terminal query (Device Attributes,
+                    // cursor-position report, …). Must reach the pty or the
+                    // program blocks on its timeout (slow `hx`, broken completion).
+                    let mut writer = self.stdin_writer.lock();
+                    let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
                 }
                 TerminalEvent::Exit => {
                     if let Some(ref callback) = self.exit_callback {
@@ -920,11 +1050,17 @@ impl Render for TerminalView {
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
+        let last_cell_size = self.last_cell_size.clone();
 
         div()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_send_tab))
+            .on_action(cx.listener(Self::on_send_backtab))
+            .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_paste))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -932,7 +1068,15 @@ impl Render for TerminalView {
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
                 canvas(
-                    move |bounds, _window, _cx| bounds,
+                    {
+                        // Capture the content bounds so mouse handlers can map
+                        // pixels to grid cells.
+                        let last_bounds = self.last_bounds.clone();
+                        move |bounds, _window, _cx| {
+                            last_bounds.set(Some(bounds));
+                            bounds
+                        }
+                    },
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
 
@@ -947,6 +1091,8 @@ impl Render for TerminalView {
                             (bounds.size.height - padding.top - padding.bottom).into();
                         let cell_width_f32: f32 = measured_renderer.cell_width.into();
                         let cell_height_f32: f32 = measured_renderer.cell_height.into();
+                        // Expose the measured cell size to the mouse handlers.
+                        last_cell_size.set((cell_width_f32, cell_height_f32));
 
                         let cols = ((available_width / cell_width_f32) as usize).max(1);
                         let rows = ((available_height / cell_height_f32) as usize).max(1);

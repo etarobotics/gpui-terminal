@@ -464,6 +464,10 @@ impl TerminalRenderer {
         let num_cols = grid.columns();
         let colors = term.colors();
 
+        // Current selection range (in buffer coordinates), for the highlight
+        // overlay painted below.
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
+
         // Calculate default background color
         let default_bg = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
@@ -486,9 +490,15 @@ impl TerminalRenderer {
             y: bounds.origin.y + padding.top,
         };
 
+        // How far the viewport is scrolled back into history. Cells are indexed
+        // relative to the active area (line 0 = top of the active screen), so
+        // subtracting the offset walks up into the scrollback (alacritty allows
+        // negative line indices for history).
+        let display_offset = grid.display_offset() as i32;
+
         // Iterate over visible lines
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - display_offset);
 
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
@@ -710,11 +720,53 @@ impl TerminalRenderer {
                         .shape_line(text, self.font_size, &[text_run], None);
 
                 // Paint at exact cell position (ignore errors)
-                let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+                let _ = shaped_line.paint(
+                    Point { x, y },
+                    self.cell_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    _cx,
+                );
             }
         }
 
-        // Paint cursor
+        // Selection highlight: a translucent overlay over selected cells. Drawn
+        // after the text so it tints the whole run uniformly.
+        if let Some(sel) = selection {
+            let sel_color = Hsla {
+                h: 0.58,
+                s: 0.6,
+                l: 0.55,
+                a: 0.30,
+            };
+            for line_idx in 0..num_lines {
+                let line = Line(line_idx as i32 - display_offset);
+                for col_idx in 0..num_cols {
+                    if sel.contains(AlacPoint::new(line, Column(col_idx))) {
+                        let x = origin.x + self.cell_width * (col_idx as f32);
+                        let y = origin.y + self.cell_height * (line_idx as f32);
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point { x, y },
+                                size: Size {
+                                    width: self.cell_width,
+                                    height: self.cell_height,
+                                },
+                            },
+                            px(0.0),
+                            sel_color,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Paint cursor — only on the live screen; hide it while scrolled back.
+        if display_offset == 0 {
         let cursor_point = grid.cursor.point;
         let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
         let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
@@ -743,6 +795,7 @@ impl TerminalRenderer {
             transparent_black(),
             Default::default(),
         ));
+        }
     }
 }
 

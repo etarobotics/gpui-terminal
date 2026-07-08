@@ -67,6 +67,12 @@ pub enum TerminalEvent {
     /// The terminal wants to load data from the clipboard.
     ClipboardLoad,
 
+    /// The terminal produced bytes that must be written back to the pty — the
+    /// reply to a query the program sent (Device Attributes, cursor-position
+    /// report, etc.). Dropping these makes TUI apps (helix, vim) hang on their
+    /// query timeout and breaks shell completion.
+    PtyWrite(Vec<u8>),
+
     /// The terminal process has exited.
     Exit,
 }
@@ -144,14 +150,19 @@ impl EventListener for GpuiEventProxy {
             }
             // Ignore events we don't care about
             Event::MouseCursorDirty => {}
-            Event::PtyWrite(ref _data) => {
-                // This is handled internally by alacritty
+            // The reply alacritty generated to a program's query must go back to
+            // the pty, or the program hangs on its query timeout. Forward it.
+            Event::PtyWrite(data) => {
+                self.send(TerminalEvent::PtyWrite(data.into_bytes()));
             }
-            Event::ColorRequest(ref _index, ref _format) => {
-                // Color requests are not commonly used
+            Event::ColorRequest(_index, ref _format) => {
+                // Color queries (OSC 4/10/11): not answered yet. Apps that probe
+                // fg/bg fall back to defaults rather than hang (they don't block
+                // on this the way they do on Device Attributes).
             }
             Event::TextAreaSizeRequest(ref _format) => {
-                // Text area size requests are handled internally
+                // Text-area size query: not answered yet (needs pixel metrics
+                // plumbed here); rarely blocking.
             }
             Event::CursorBlinkingChange => {
                 // Cursor blinking changes could be handled if needed
