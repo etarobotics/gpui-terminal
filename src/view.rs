@@ -775,7 +775,6 @@ impl TerminalView {
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        tracing::warn!("DIAG TerminalView::on_key_down fired: {:?}", event.keystroke);
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -784,12 +783,9 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
-        let converted = keystroke_to_bytes(&event.keystroke, self.state.mode());
-        tracing::warn!("DIAG keystroke_to_bytes result: {:?}", converted);
-        if let Some(bytes) = converted {
+        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
             let mut writer = self.stdin_writer.lock();
-            let write_result = writer.write_all(&bytes);
-            tracing::warn!("DIAG writer.write_all result: {:?}", write_result.is_ok());
+            let _ = writer.write_all(&bytes);
             let _ = writer.flush();
             // Consume the event so the host UI's focus system (Tab navigation,
             // etc.) doesn't also act on keys that belong to the shell.
@@ -838,7 +834,6 @@ impl TerminalView {
 
     /// Start a drag-selection at the clicked cell.
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        tracing::warn!("DIAG TerminalView::on_mouse_down fired");
         window.focus(&self.focus_handle, cx);
         if let Some((point, side)) = self.cell_at(event.position) {
             self.state.with_term_mut(|t| {
