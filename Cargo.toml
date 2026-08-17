@@ -9,7 +9,10 @@ authors = ["Leonard Seibold <git[@]zrtx.de"]
 
 [dependencies]
 gpui = "0.2.2"
-alacritty_terminal = "0.25.1"
+# Our fork's nh/wasm32-support: gates the native-only pty event loop
+# (event_loop/thread/tty — polling has no wasm32 backend at all) so this
+# crate itself can target wasm32.
+alacritty_terminal = { git = "https://github.com/etarobotics/alacritty", rev = "b704600ef81422a911294ad8e718d5af89eaf4fd" }
 anyhow = "1"
 ropey = "1"
 parking_lot = "0.12"
