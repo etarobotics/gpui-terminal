@@ -338,6 +338,11 @@
 //! to accommodate tall glyphs.
 
 pub mod box_drawing;
+// System clipboard access (arboard) has no wasm32 backend — no browser has a
+// synchronous, permission-less native-clipboard API to speak to anyway
+// (`navigator.clipboard` is async and gated behind a user gesture), so this
+// stays native only rather than stubbed.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod clipboard;
 pub mod colors;
 pub mod event;
@@ -348,6 +353,7 @@ pub mod terminal;
 pub mod view;
 
 // Re-export main types for convenience
+#[cfg(not(target_arch = "wasm32"))]
 pub use clipboard::Clipboard;
 pub use colors::{ColorPalette, ColorPaletteBuilder};
 pub use event::{GpuiEventProxy, TerminalEvent};

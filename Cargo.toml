@@ -11,11 +11,16 @@ authors = ["Leonard Seibold <git[@]zrtx.de"]
 gpui = "0.2.2"
 alacritty_terminal = "0.25.1"
 anyhow = "1"
-portable-pty = "0.9"
 ropey = "1"
 parking_lot = "0.12"
 flume = "0.12"
 
-[dependencies.arboard]
+# Only ever used by this crate's own `src/main.rs` demo (never by the
+# library) and doesn't build for wasm32 (no OS pty on that target) — native
+# only. See patch notes.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+portable-pty = "0.9"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.arboard]
 version = "3"
 features = ["wayland-data-control"]

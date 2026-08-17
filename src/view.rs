@@ -524,6 +524,12 @@ impl TerminalView {
 
         // Spawn background thread to read from stdout
         // This thread sends bytes through the async channel
+        //
+        // wasm32 has no OS threads at all, so `stdout_reader`/`bytes_tx` go
+        // unused there — wasm32 embedders call `feed_bytes` directly from
+        // their own async transport (e.g. a WebSocket message handler)
+        // instead of a blocking `Read`.
+        #[cfg(not(target_arch = "wasm32"))]
         thread::spawn(move || {
             Self::read_stdout_blocking(stdout_reader, bytes_tx);
         });
@@ -576,6 +582,16 @@ impl TerminalView {
             last_cell_size: Rc::new(Cell::new((0.0, 0.0))),
             selecting: false,
         }
+    }
+
+    /// Feed already-received output bytes directly into the terminal, for
+    /// platforms with no OS threads to run the native blocking-`Read` pump
+    /// (see the wasm32 branch in `Self::new`). Call this from whatever
+    /// async transport delivers the bytes (e.g. a WebSocket `onmessage`).
+    #[cfg(target_arch = "wasm32")]
+    pub fn feed_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.state.process_bytes(bytes);
+        cx.notify();
     }
 
     /// Set a callback to be invoked when the terminal is resized.
