@@ -17,6 +17,7 @@ anyhow = "1"
 ropey = "1"
 parking_lot = "0.12"
 flume = "0.12"
+tracing = "0.1"
 
 # Only ever used by this crate's own `src/main.rs` demo (never by the
 # library) and doesn't build for wasm32 (no OS pty on that target) — native
