@@ -8,7 +8,7 @@ repository = "https://github.com/zortax/gpui-terminal"
 authors = ["Leonard Seibold <git[@]zrtx.de"]
 
 [dependencies]
-gpui = "0.2.2"
+gpui = { package = "gpui-pre", version = "=0.3.10" }
 # Our fork's nh/wasm32-support: gates the native-only pty event loop
 # (event_loop/thread/tty — polling has no wasm32 backend at all) so this
 # crate itself can target wasm32.
